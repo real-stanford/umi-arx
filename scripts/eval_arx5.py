@@ -24,6 +24,7 @@ Press "S" to stop evaluation and gain control back.
 import sys
 import os
 from queue import Queue
+from omegaconf import open_dict
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 sys.path.append(ROOT_DIR)
@@ -48,8 +49,10 @@ from utils.real_inference_util import (
     get_real_umi_obs_dict,
     get_real_umi_action,
 )
+from utils.cv_util import draw_predefined_mask
 from peripherals.spacemouse_shared_memory import Spacemouse
-from utils.pose_util import pose_to_mat, mat_to_pose
+from utils.pose_util import pose_to_mat, mat_to_pose, rot6d_to_mat
+import scipy.spatial.transform as st
 from modules.arx5_env import Arx5Env
 import zmq
 
@@ -122,20 +125,14 @@ def solve_sphere_collision(ee_poses, robots_config):
 @click.option("--output", "-o", required=True, help="Directory to save recording")
 @click.option("--policy_ip", default="localhost")
 @click.option("--policy_port", default=8766)
-@click.option(
-    "--match_dataset",
-    "-m",
-    default=None,
-    help="Dataset used to overlay and adjust initial condition",
-)
+@click.option("--robot_port", default=8765)
+@click.option("--match_dataset_path", default=None, type=str)
 @click.option(
     "--match_episode",
-    "-me",
     default=None,
     type=int,
     help="Match specific episode from the match dataset",
 )
-@click.option("--match_camera", "-mc", default=0, type=int)
 @click.option("--camera_reorder", "-cr", default="0")
 @click.option(
     "--vis_camera_idx", default=0, type=int, help="Which RealSense camera to visualize."
@@ -150,7 +147,7 @@ def solve_sphere_collision(ee_poses, robots_config):
 @click.option(
     "--steps_per_inference",
     "-si",
-    default=12,
+    default=4,
     type=int,
     help="Action horizon for inference.",
 )
@@ -161,7 +158,7 @@ def solve_sphere_collision(ee_poses, robots_config):
     help="Max duration for each epoch in seconds.",
 )
 @click.option(
-    "--frequency", "-f", default=8, type=float, help="Control frequency in Hz."
+    "--frequency", "-f", default=5, type=float, help="Control frequency in Hz."
 )
 @click.option(
     "--command_latency",
@@ -174,14 +171,15 @@ def solve_sphere_collision(ee_poses, robots_config):
 @click.option("-sf", "--sim_fov", type=float, default=None)
 @click.option("-ci", "--camera_intrinsics", type=str, default=None)
 @click.option("--mirror_swap", is_flag=True, default=False)
+@click.option("--task_name", type=str, default='')
 def main(
     input,
     output,
     policy_ip,
     policy_port,
-    match_dataset,
+    robot_port,
+    match_dataset_path,
     match_episode,
-    match_camera,
     camera_reorder,
     vis_camera_idx,
     init_joints,
@@ -193,17 +191,42 @@ def main(
     sim_fov,
     camera_intrinsics,
     mirror_swap,
+    task_name,
 ):
     pid = os.getpid()
     os.sched_setaffinity(pid, [7])
     max_gripper_width = 0.085
-    gripper_speed = 0.02
+    gripper_speed = 0.04
     cartesian_speed = 0.4
     orientation_speed = 0.8
-
     os.makedirs(output, exist_ok=True)
     os.makedirs(os.path.join(output, "obs"), exist_ok=True)
     os.makedirs(os.path.join(output, "action"), exist_ok=True)
+
+    if match_dataset_path is not None:
+        assert match_episode is not None
+        assert os.path.exists(os.path.join(match_dataset_path, "obs", f"{match_episode}/0.npy")), "match_episode does not exist"
+        match_episode_min = match_episode
+        while True:
+            match_episode_min -= 1
+            if not os.path.exists(os.path.join(match_dataset_path, "obs", f"{match_episode_min}/0.npy")):
+                break
+        match_episode_min += 1
+        match_episode_max = match_episode
+        while True:
+            match_episode_max += 1
+            if not os.path.exists(os.path.join(match_dataset_path, "obs", f"{match_episode_max}/0.npy")):
+                break
+        match_episode_max -= 1
+        print(f"match_episode: {match_episode}, match_episode_min: {match_episode_min}, match_episode_max: {match_episode_max}")
+
+
+    ###################################################################################################################################################################################################
+    if task_name == 'cup':
+        no_mirror = True
+    else:
+        no_mirror = False
+    ###################################################################################################################################################################################################
 
     tx_left_right = np.array(
         [
@@ -215,6 +238,7 @@ def main(
     )
     tx_robot1_robot0 = tx_left_right
 
+
     # load checkpoint
     ckpt_path = input
     if not ckpt_path.endswith(".ckpt"):
@@ -225,13 +249,21 @@ def main(
     # import torch
     # payload = torch.load(open(ckpt_path, 'rb'), map_location='cpu', pickle_module=dill)
     # cfg = payload['cfg']
+    
     obs_pose_rep = cfg.task.pose_repr.obs_pose_repr
     action_pose_repr = cfg.task.pose_repr.action_pose_repr
     print("obs_pose_rep", obs_pose_rep)
     print("action_pose_repr", action_pose_repr)
-    print("model_name:", cfg.policy.obs_encoder.model_name)
-    print("dataset_path:", cfg.task.dataset.dataset_path)
 
+    max_obs_buffer_size = 1000
+
+    if cfg.name=='uva':
+        with open_dict(cfg):
+            # cfg.task.shape_meta = cfg.task.dataset.shape_meta
+            cfg.task.shape_meta.obs.camera0_rgb.horizon = 16
+            cfg.task.shape_meta.obs.robot0_eef_pos.horizon = 16
+        max_obs_buffer_size = 1000
+    
     # setup experiment
     dt = 1 / frequency
 
@@ -241,7 +273,7 @@ def main(
         {
             "robot_type": "arx5",
             "robot_ip": "127.0.0.1",
-            "robot_port": 8765,
+            "robot_port": robot_port,
             "robot_obs_latency": 0.005,  # TODO: need to measure
             "robot_action_latency": 0.04,  # TODO: need to measure
             "height_threshold": -0.2,  # TODO: ncscseed to measure
@@ -263,6 +295,7 @@ def main(
             robots_config=robots_config,
             frequency=frequency,
             obs_image_resolution=obs_res,
+            max_obs_buffer_size=max_obs_buffer_size,
             obs_float32=True,
             camera_reorder=[int(x) for x in camera_reorder],
             init_joints=init_joints,
@@ -282,7 +315,7 @@ def main(
         ) as env:
             cv2.setNumThreads(2)
             print("Waiting for camera")
-            time.sleep(1.0)
+            # time.sleep(3.0)
 
             print("Waiting for env ready.")
             while not env.is_ready:
@@ -298,10 +331,12 @@ def main(
                 video_path = str(video_dir.joinpath(f"{i}.mp4").absolute())
                 video_paths.append(video_path)
             env.camera.start_recording(video_path=video_paths, start_time=time.time())
+            time.sleep(3.0)
 
             print(f"Warming up policy inference")
             obs = env.get_obs()
             print(obs)
+
             episode_start_pose = list()
             for robot_id in range(len(robots_config)):
                 pose = np.concatenate(
@@ -312,6 +347,21 @@ def main(
                     axis=-1,
                 )[-1]
                 episode_start_pose.append(pose)
+
+            ####################################################
+            ## reduce observation
+            original_imgs = obs['camera0_rgb']
+            if obs['camera0_rgb'].shape[0] > 4:
+                T = 16
+                indices = [3, 7, 11, 15]
+                obs["camera0_rgb"] = obs['camera0_rgb'][indices, :, :, :]
+                obs["robot0_eef_pos"] = obs["robot0_eef_pos"][indices]
+                obs["robot0_eef_rot_axis_angle"] = obs["robot0_eef_rot_axis_angle"][indices]
+                obs["robot0_gripper_width"] = obs["robot0_gripper_width"][indices]
+                print('indices', indices)
+            ####################################################
+
+
             obs_dict_np = get_real_umi_obs_dict(
                 env_obs=obs,
                 shape_meta=cfg.task.shape_meta,
@@ -319,6 +369,9 @@ def main(
                 tx_robot1_robot0=tx_robot1_robot0,
                 episode_start_pose=episode_start_pose,
             )
+            
+            
+            obs_dict_np['task_name'] = task_name
 
             socket.send_pyobj(obs_dict_np)
             print(
@@ -346,6 +399,7 @@ def main(
 
             print("Ready!")
             while True:
+                last_control_is_human = True
                 # ========= human control loop ==========
                 print("Human in control!")
                 robot_states = env.get_robot_state()
@@ -368,6 +422,7 @@ def main(
                     # pump obs
                     obs = env.get_obs()
 
+
                     # visualize
                     episode_id = env.replay_buffer.n_episodes
                     os.makedirs(
@@ -376,14 +431,17 @@ def main(
                     os.makedirs(
                         os.path.join(output, "action", f"{episode_id}"), exist_ok=True
                     )
-                    vis_img = obs[f"camera{match_camera}_rgb"][-1]
-                    obs_left_img = obs["camera0_rgb"][-1]
-                    obs_right_img = obs["camera0_rgb"][-1]
-                    vis_img = np.concatenate(
-                        [obs_left_img, obs_right_img, vis_img], axis=1
-                    )
+                    vis_img = obs[f"camera0_rgb"][-1]
 
-                    text = f"Episode: {episode_id}"
+                    if match_dataset_path is not None:
+                        assert match_episode is not None
+                        match_data = np.load(os.path.join(match_dataset_path, "obs", f"{match_episode}/0.npy"), allow_pickle=True).item()
+                        obs_left_img = match_data["obs"]['camera0_rgb'][-1]
+                        vis_img = np.concatenate(
+                            [obs_left_img, vis_img], axis=1
+                        )
+
+                    text = f"Episode: {episode_id}, matching: {match_episode} ({match_dataset_path})"
                     cv2.putText(
                         vis_img,
                         text,
@@ -420,12 +478,43 @@ def main(
                             # Next episode
                             if match_episode is not None:
                                 match_episode = min(
-                                    match_episode + 1, env.replay_buffer.n_episodes - 1
+                                    match_episode + 1, match_episode_max
                                 )
+                                print(f"match_episode: {match_episode}")
                         elif key_stroke == KeyCode(char="w"):
                             # Prev episode
                             if match_episode is not None:
-                                match_episode = max(match_episode - 1, 0)
+                                match_episode = max(match_episode - 1, match_episode_min)
+                                print(f"match_episode: {match_episode}")
+                        elif key_stroke == KeyCode(char="m"):
+                            # Move robot to the starting pose in waiting_time seconds
+                            waiting_time = 5.0
+                            print("starting dataset smatching")
+
+                            if match_episode is not None and match_dataset_path is not None:
+                                # DEBUG: to be tested
+                                match_data = np.load(os.path.join(match_dataset_path, "obs", f"{match_episode}/0.npy"), allow_pickle=True).item()
+                                for robot_idx in range(len(robots_config)):
+                                    start_pos = match_data["obs"][f"robot{robot_idx}_eef_pos"][-1]
+                                    start_rot = match_data["obs"][f"robot{robot_idx}_eef_rot_axis_angle"][-1]
+                                    target_pose = np.concatenate((start_pos, start_rot), axis=0)[np.newaxis, ...]
+
+                                    gripper_target_pos = match_data["obs"][f"robot{robot_idx}_gripper_width"][-1]
+                                action = np.zeros((7 * len(robots_config),))
+                                print(target_pose)
+                                for robot_idx in range(len(robots_config)):
+                                    action[7 * robot_idx + 0 : 7 * robot_idx + 6] = target_pose[robot_idx]
+                                    action[7 * robot_idx + 6] = gripper_target_pos[robot_idx]
+                                env.exec_actions(
+                                    actions=[action],
+                                    timestamps=[t_command_target - time.monotonic() + time.time() + waiting_time],
+                                    compensate_latency=False,
+                                )
+                                print(f"executing action: {action}")
+                                precise_wait(t_cycle_end + waiting_time)
+                                iter_idx += int(waiting_time / dt)
+                                continue
+                            
                         elif key_stroke == Key.backspace:
                             if click.confirm("Are you sure to drop an episode?"):
                                 env.drop_episode()
@@ -436,7 +525,7 @@ def main(
                             control_robot_idx_list = [0]
                         elif key_stroke == KeyCode(char="2"):
                             control_robot_idx_list = [1]
-
+                    
                     if start_policy:
                         break
                     precise_wait(t_sample)
@@ -518,6 +607,7 @@ def main(
 
                     # get current pose
                     obs = env.get_obs()
+
                     episode_start_pose = list()
                     for robot_id in range(len(robots_config)):
                         pose = np.concatenate(
@@ -528,6 +618,8 @@ def main(
                             axis=-1,
                         )[-1]
                         episode_start_pose.append(pose)
+
+
 
                     # wait for 1/30 sec to get the closest frame actually
                     # reduces overall latency
@@ -542,8 +634,42 @@ def main(
 
                         # get obs
                         obs = env.get_obs()
+                        # if no_mirror:
+                        #     for i, camera0_rgb in enumerate(obs[f"camera0_rgb"]):
+                        #         obs[f"camera0_rgb"][i] = draw_predefined_mask(
+                        #             camera0_rgb, (0,0,0), mirror=no_mirror, gripper=False, finger=False, use_aa=True
+                        #         )
                         obs_timestamps = obs["timestamp"]
                         print(f"Obs latency {time.time() - obs_timestamps[-1]}")
+                        if np.mean(obs["camera0_rgb"][-1]) < 0.1:
+                            raise RuntimeError("Camera not connected")
+                        # # HACK: Only use the last image    
+                        # obs["camera0_rgb"] = np.array([obs["camera0_rgb"][-1] for _ in obs["camera0_rgb"]])
+                        if last_control_is_human:
+                            # Pad the entire observatioscsn with the last frame
+                            print(f"padding using the last observation")
+                            for k, v in obs.items():
+                                if k != 'timestamp':
+                                    original_length = v.shape[0]
+                                    obs[k] = np.concatenate([v[-1:]] * original_length, axis=0)
+
+                        last_control_is_human = False
+                        ####################################################
+                        ## reduce observation
+                        original_imgs = obs['camera0_rgb']
+                        if obs['camera0_rgb'].shape[0] > 4:
+                            T = 16
+                            # select_timesteps = 4
+                            # indices = np.arange(0, T, step=T//select_timesteps) + select_timesteps - 1
+                            # indices = [12, 13, 14, 15]
+                            indices = [3, 7, 11, 15]
+                            obs["camera0_rgb"] = obs['camera0_rgb'][indices, :, :, :]
+                            
+                            obs["robot0_eef_pos"] = obs["robot0_eef_pos"][indices]
+                            obs["robot0_eef_rot_axis_angle"] = obs["robot0_eef_rot_axis_angle"][indices]
+                            obs["robot0_gripper_width"] = obs["robot0_gripper_width"][indices]
+                            print('indices', indices)
+                        ####################################################
 
                         # run inference
                         s = time.time()
@@ -554,10 +680,15 @@ def main(
                             tx_robot1_robot0=tx_robot1_robot0,
                             episode_start_pose=episode_start_pose,
                         )
+                        
+                        obs_dict_np['task_name'] = task_name
+
+
                         obs_data = {
                             "obs_dict_np": obs_dict_np,
                             "obs_pose_rep": obs_pose_rep,
                             "obs": obs,
+                            "original_imgs": original_imgs,
                             "episode_start_pose": episode_start_pose,
                             "tx_robot1_robot0": tx_robot1_robot0,
                         }
@@ -568,9 +699,23 @@ def main(
                             obs_data,
                             allow_pickle=True,
                         )
-
+                        
+                        
                         socket.send_pyobj(obs_dict_np)
                         raw_action = socket.recv_pyobj()
+
+                        # print(raw_action[:, :3])
+
+                        for k, raw_action_cmd in enumerate(raw_action):
+                            translation = raw_action_cmd[:3]
+                            rotation = st.Rotation.from_matrix(rot6d_to_mat(raw_action_cmd[3:9])).as_rotvec()
+                            if np.max(np.abs(translation)) / (k+1) > 0.1:
+                                print(f"==============={np.mean(obs['camera0_rgb'][-1])}================")
+                                print(f"  {translation}, {rotation}")
+
+                                raise RuntimeError("Action translation too large. Please check the input")
+
+                        
                         if type(raw_action) == str:
                             print(
                                 f"Inference from PolicyInferenceNode failed: {raw_action}. Please check the model."

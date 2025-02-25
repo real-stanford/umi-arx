@@ -79,7 +79,7 @@ class Arx5Controller(mp.Process):
             shm_manager=shm_manager,
             examples=example,
             get_max_k=get_max_k,
-            get_time_budget=0.2,
+            get_time_budget=0.5,
             put_desired_frequency=frequency,
         )
         self.launch_timeout = launch_timeout
@@ -212,6 +212,7 @@ class Arx5Controller(mp.Process):
         # gain['kd'] = gain['kd'] * 0.2
         gain = self.robot_client.get_gain()
         gain["kp"] = np.array([300, 300, 400, 80, 50, 30])
+        gain["kd"][3] = 0.5 # Some motors will shake if kd is high
         self.robot_client.set_gain(gain)
         np.set_printoptions(precision=3, suppress=True)
 
@@ -338,6 +339,7 @@ class Arx5Controller(mp.Process):
                         self.reset_success.value = True
                         gain = self.robot_client.get_gain()
                         gain["kp"] = np.array([300, 300, 400, 80, 50, 30])
+                        gain["kd"][3] = 0.5
                         self.robot_client.set_gain(gain)
 
                     elif cmd == Command.ADD_WAYPOINT.value:
@@ -403,7 +405,6 @@ class Arx5Controller(mp.Process):
                         best_latency = np.arange(
                             matching_dt, max_latency, latency_precision
                         )[np.argmin(errors)]
-                        # best_latency = 0.0
 
                         smoothened_input_poses = input_poses
                         new_times = input_times - input_times[0] + t_now - best_latency
